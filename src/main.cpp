@@ -1,3 +1,4 @@
+
 #include <Arduino.h>
 #include "esp32-hal-cpu.h"
 
@@ -10,14 +11,14 @@
 #define MOTOR_IN2 23
 #define ENA 25
 
-int f = 128; 
+int f = 160;
 
 void setup() {
     Serial.begin(115200);
     setCpuFrequencyMhz(240);
 
     Serial.printf("CPU: %u MHz\n", getCpuFrequencyMhz());
-    
+
     analogReadResolution(12);
 
     analogSetPinAttenuation(SENSOR1_PIN, ADC_11db);
@@ -34,25 +35,33 @@ void setup() {
 }
 
 void loop() {
-    
+
     if (Serial.available() > 0) {
         String input = Serial.readStringUntil('\n');
-        input.trim(); 
+        input.trim();
+
         if (input.length() > 0) {
             int valor = input.toInt();
-            f = constrain(valor, 0, 255); 
-            Serial.printf("Nova velocidade definida: %d\n", f);
+            f = constrain(valor, 0, 255);
+
+            Serial.printf("Novo PWM definido: %d\n", f);
         }
     }
 
     int sensor1 = analogRead(SENSOR1_PIN);
     int sensor2 = analogRead(SENSOR2_PIN);
-    
+
+    // Média dos dois sensores
+    float media = (sensor1 + sensor2) / 2.0f;
+
     analogWrite(ENA, f);
     digitalWrite(MOTOR_IN1, HIGH);
     digitalWrite(MOTOR_IN2, LOW);
-    
-    Serial.printf("S1: %d | S2: %d | PWM: %d\n", sensor1, sensor2, f);
 
-    delay(50); 
+    Serial.printf(
+        "S1: %d | S2: %d | Media: %.2f | PWM: %d\n",
+        sensor1, sensor2, media, f
+    );
+
+    delay(50);
 }

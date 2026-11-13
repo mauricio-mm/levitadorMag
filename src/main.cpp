@@ -1,6 +1,8 @@
 
 #include <Arduino.h>
 #include "esp32-hal-cpu.h"
+#include <math.h>
+#include <stdbool.h>
 
 // Sensores
 #define SENSOR1_PIN 32
@@ -12,6 +14,73 @@
 #define ENA 25
 
 int f = 160;
+
+// Funcao 1: ADC baseado na posicao
+float funcaoAltura(float p) {
+
+    return ((((61.378f * p
+             - 369.555f) * p
+             + 524.572f) * p
+             + 523.232f) * p
+             + 1647.811f);
+}
+
+// Funcao 2: efeito do PWM no ADC
+float funcaoPWM(float pwm) {
+
+    float q = pwm / 255.0f;
+
+    return ((((1850.009f * q
+              - 2998.558f) * q
+              + 1442.138f) * q
+              - 236.195f) * q);
+}
+
+// Funcao inversa:
+// PWM + leitura ADC -> posicao da esfera em cm
+bool calcularPosicao(float pwm, float fluxoADC, float *posicao) {
+    if (posicao == NULL ||
+        !isfinite(pwm) ||
+        !isfinite(fluxoADC) ||
+        pwm < 0.0f ||
+        pwm > 255.0f) {
+        return false;
+    }
+
+    // Remove influencia estimada do PWM
+    float adcCorrigido =
+        fluxoADC - funcaoPWM(pwm);
+
+    // Limites da calibracao: 0 a 3 cm
+    float minimo = funcaoAltura(0.0f);
+    float maximo = funcaoAltura(3.0f);
+
+    if (adcCorrigido < minimo ||
+        adcCorrigido > maximo) {
+        return false;
+    }
+
+    // Bissecao
+    float esquerda = 0.0f;
+    float direita = 3.0f;
+
+    for (int i = 0; i < 24; i++) {
+
+        float meio =
+            (esquerda + direita) / 2.0f;
+
+        float estimativa = funcaoAltura(meio);
+
+        if (estimativa < adcCorrigido) {
+            esquerda = meio;
+        } else {
+            direita = meio;
+        }
+    }
+
+    *posicao = (esquerda + direita) / 2.0f;
+    return true;
+}
 
 void setup() {
     Serial.begin(115200);
@@ -63,5 +132,6 @@ void loop() {
         sensor1, sensor2, media, f
     );
 
-    delay(50);
+    delay(10);
 }
+

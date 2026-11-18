@@ -2,254 +2,279 @@
 #include <Arduino.h>
 #include "esp32-hal-cpu.h"
 #include "altura.h"
+#include <math.h>
+#include <stdio.h>
 
-// Sensores Hall
 #define SENSOR1_PIN 32
 #define SENSOR2_PIN 33
 
-// Ponte H L298N
 #define MOTOR_IN1 22
 #define MOTOR_IN2 23
 #define ENA 25
 
-// Controlador PD
-const float SETPOINT_CM = 2.00f;
-const float KP = 60.0f;
-const float KD = 0.0f;
+float ALTURA_REFERENCIA = 2.0f;
+float PWM_BASE = 190.0f;
 
-const int PWM_BASE = 170;
-const int PWM_MIN = 160;
-const int PWM_MAX = 180;
+float KP = 30.0f;
+float KD = 1.0f;
 
-// Amostragem e segurança
-const unsigned long TS_MS = 20;
-const unsigned long MAX_ATIVO_MS = 15000;
+const float KP_MIN = 0.0f;
+const float KP_MAX = 100.0f;
+const float KD_MIN = 0.0f;
+const float KD_MAX = 20.0f;
 
-const float ALPHA_MEDIA = 0.25f;
-const float ALPHA_VELOCIDADE = 0.10f;
+const float ALTURA_MIN = 1.0f;
+const float ALTURA_MAX = 3.4f;
 
-enum Estado { DESLIGADO, AGUARDANDO, CONTROLE_PD };
-Estado estado = DESLIGADO;
+const float PWM_BASE_MIN = 0.0f;
+const float PWM_BASE_MAX = 230.0f;
 
-// Variáveis de controle
-float mediaFiltrada = 0.0f;
-float alturaAnterior = NAN;
+const int PWM_MIN = 0;
+const int PWM_MAX = 230;
+
+const unsigned long INTERVALO_CONTROLE = 1000;
+const unsigned long INTERVALO_PRINT = 50000;
+
+float alturaFiltrada = 0.0f;
 float velocidadeFiltrada = 0.0f;
+float alturaAnterior = 0.0f;
+float pwmCalculado = 0.0f;
 
-bool filtroIniciado = false;
-
-int pwmAtual = 0;
-int contadorEstavel = 0;
-int contadorFora = 0;
+bool controleAtivo = false;
+bool primeiraLeitura = true;
+bool aguardandoGanhos = false;
+bool aguardandoAltura = false;
+bool aguardandoPWM = false;
 
 unsigned long ultimoControle = 0;
-unsigned long ultimaImpressao = 0;
-unsigned long iniciouAtivo = 0;
+unsigned long ultimoPrint = 0;
 
-// Desliga o eletroímã
-void desligar(const char* motivo) {
+void desligarMotor() {
     analogWrite(ENA, 0);
-
-    pwmAtual = 0;
-    estado = DESLIGADO;
-    contadorEstavel = 0;
-    contadorFora = 0;
-
-    alturaAnterior = NAN;
-    velocidadeFiltrada = 0.0f;
-
-    Serial.printf("DESLIGADO: %s\n", motivo);
+    pwmCalculado = 0;
 }
 
-// Atualiza o PWM somente quando necessário
-void aplicarPWM(int valor) {
-    valor = constrain(valor, 0, PWM_MAX);
+void iniciarControle() {
+    int sensor1 = analogRead(SENSOR1_PIN);
+    int sensor2 = analogRead(SENSOR2_PIN);
 
-    if (valor != pwmAtual) {
-        pwmAtual = valor;
-        analogWrite(ENA, pwmAtual);
+    float media = (sensor1 + sensor2) / 2.0f;
+    alturaFiltrada = calcularAltura(media);
+    alturaAnterior = alturaFiltrada;
+    velocidadeFiltrada = 0.0f;
+
+    primeiraLeitura = false;
+    ultimoControle = micros();
+    ultimoPrint = millis() * 1000UL;
+
+    controleAtivo = true;
+
+    Serial.println("Controle iniciado");
+}
+
+void processarComando(String comando) {
+    comando.trim();
+
+    if (comando.length() == 0) {
+        return;
+    }
+
+    if (aguardandoGanhos || aguardandoAltura || aguardandoPWM) {
+        float valor1;
+        float valor2;
+
+        if (aguardandoGanhos) {
+            if (sscanf(comando.c_str(), "%f,%f", &valor1, &valor2) == 2 &&
+                isfinite(valor1) && isfinite(valor2)) {
+
+                if (valor1 >= KP_MIN && valor1 <= KP_MAX &&
+                    valor2 >= KD_MIN && valor2 <= KD_MAX) {
+
+                    KP = valor1;
+                    KD = valor2;
+
+                    Serial.printf("Novos ganhos: KP = %.2f | KD = %.2f\n", KP, KD);
+                } else {
+                    Serial.println("Valores fora dos limites permitidos");
+                }
+            } else {
+                Serial.println("Formato invalido. Utilize: KP,KD");
+            }
+
+            aguardandoGanhos = false;
+            return;
+        }
+
+        if (aguardandoAltura) {
+            float alturaNova = comando.toFloat();
+
+            if (isfinite(alturaNova) && alturaNova >= ALTURA_MIN &&
+                alturaNova <= ALTURA_MAX) {
+
+                ALTURA_REFERENCIA = alturaNova;
+                Serial.printf("Nova altura de referencia: %.2f cm\n", ALTURA_REFERENCIA);
+            } else {
+                Serial.printf("Altura invalida. Utilize um valor entre %.1f e %.1f cm\n",
+                              ALTURA_MIN, ALTURA_MAX);
+            }
+
+            aguardandoAltura = false;
+            return;
+        }
+
+        if (aguardandoPWM) {
+            float pwmNovo = comando.toFloat();
+
+            if (isfinite(pwmNovo) && pwmNovo >= PWM_BASE_MIN &&
+                pwmNovo <= PWM_BASE_MAX) {
+
+                PWM_BASE = pwmNovo;
+                Serial.printf("Novo PWM base: %.2f\n", PWM_BASE);
+            } else {
+                Serial.printf("PWM invalido. Utilize um valor entre %.0f e %.0f\n",
+                              PWM_BASE_MIN, PWM_BASE_MAX);
+            }
+
+            aguardandoPWM = false;
+            return;
+        }
+    }
+
+    comando.toLowerCase();
+
+    if (comando == "s") {
+        if (!controleAtivo) {
+            iniciarControle();
+        } else {
+            Serial.println("Controle ja esta ativo");
+        }
+    }
+    else if (comando == "p") {
+        controleAtivo = false;
+        desligarMotor();
+        Serial.println("Controle pausado. PWM desligado");
+    }
+    else if (comando == "c") {
+        aguardandoGanhos = true;
+        Serial.println("Digite KP,KD. Exemplo: 30,5");
+    }
+    else if (comando == "h") {
+        aguardandoAltura = true;
+        Serial.printf("Digite a nova altura de referencia em cm (%.1f a %.1f):\n",
+                      ALTURA_MIN, ALTURA_MAX);
+    }
+    else if (comando == "j") {
+        aguardandoPWM = true;
+        Serial.printf("Digite o novo PWM base (%.0f a %.0f):\n",
+                      PWM_BASE_MIN, PWM_BASE_MAX);
+    }
+    else {
+        Serial.println("Comando desconhecido");
+        Serial.println("Comandos: s, p, c, h, j");
     }
 }
 
 void setup() {
     Serial.begin(115200);
+    Serial.setTimeout(50);
+
     setCpuFrequencyMhz(240);
 
-    Serial.printf("CPU: %u MHz\n", getCpuFrequencyMhz());
-
-    // Configuração dos sensores
     analogReadResolution(12);
+
     analogSetPinAttenuation(SENSOR1_PIN, ADC_11db);
     analogSetPinAttenuation(SENSOR2_PIN, ADC_11db);
 
     pinMode(SENSOR1_PIN, INPUT);
     pinMode(SENSOR2_PIN, INPUT);
 
-    // Configuração da ponte H
     pinMode(MOTOR_IN1, OUTPUT);
     pinMode(MOTOR_IN2, OUTPUT);
     pinMode(ENA, OUTPUT);
 
-    digitalWrite(MOTOR_IN1, LOW);
-    digitalWrite(MOTOR_IN2, LOW);
-    analogWrite(ENA, 0);
-
     digitalWrite(MOTOR_IN1, HIGH);
     digitalWrite(MOTOR_IN2, LOW);
 
-    Serial.println("\n=== CONTROLE PD ===");
-    Serial.printf("Setpoint: %.2f cm\n", SETPOINT_CM);
-    Serial.printf("Kp: %.2f | Kd: %.2f\n", KP, KD);
-    Serial.printf("PWM Base: %d | Min: %d | Max: %d\n", PWM_BASE, PWM_MIN, PWM_MAX);
+    desligarMotor();
 
-    Serial.println("\nComandos:");
-    Serial.println("p = preparar controle PD");
-    Serial.println("x = desligar eletroima");
-    Serial.println("Limite: 5 segundos por ativacao\n");
+    Serial.println("Levitador magnetico pronto");
+    Serial.println("Envie s para iniciar");
+    Serial.println("Envie p para pausar");
+    Serial.println("Envie c para configurar KP e KD");
+    Serial.println("Envie h para configurar a altura de referencia");
+    Serial.println("Envie j para configurar o PWM base");
+
+    Serial.printf("Altura: %.2f cm | PWM Base: %.2f\n",
+                  ALTURA_REFERENCIA, PWM_BASE);
+    Serial.printf("KP: %.2f | KD: %.2f\n", KP, KD);
 }
 
 void loop() {
-    // Comandos via Monitor Serial
-    while (Serial.available()) {
-        char comando = (char)Serial.read();
-
-        if (comando == 'x' || comando == 'X') {
-            desligar("comando x");
-        }
-
-        if ((comando == 'p' || comando == 'P') && estado == DESLIGADO) {
-            estado = AGUARDANDO;
-            contadorEstavel = 0;
-            contadorFora = 0;
-
-            alturaAnterior = NAN;
-            velocidadeFiltrada = 0.0f;
-
-            Serial.println("AGUARDANDO: posicione a esfera proxima de 2.00 cm");
-            Serial.println("PWM permanece em 0 ate a ativacao.");
-        }
+    if (Serial.available()) {
+        String comando = Serial.readStringUntil('\n');
+        processarComando(comando);
     }
 
-    // Controle de tempo com dt real
-    unsigned long agora = millis();
-    unsigned long tempoDecorrido = agora - ultimoControle;
-
-    if (tempoDecorrido < TS_MS) return;
-
-    float dt = tempoDecorrido / 1000.0f;
-    ultimoControle = agora;
-
-    // Leitura dos sensores
-    int s1 = analogRead(SENSOR1_PIN);
-    int s2 = analogRead(SENSOR2_PIN);
-
-    float media = (s1 + s2) / 2.0f;
-
-    // Filtro exponencial da média ADC
-    if (!filtroIniciado) {
-        mediaFiltrada = media;
-        filtroIniciado = true;
-    } else {
-        mediaFiltrada += ALPHA_MEDIA * (media - mediaFiltrada);
+    if (!controleAtivo) {
+        return;
     }
 
-    // Estimativa de altura
-    float altura = calcularAltura(mediaFiltrada);
+    unsigned long agora = micros();
 
-    // Validação dos sensores
-    bool sensoresValidos =
-        s1 > 30 &&
-        s2 > 30 &&
-        s1 < 4050 &&
-        s2 < 4050 &&
-        abs(s1 - s2) < 700;
+    if (agora - ultimoControle >= INTERVALO_CONTROLE) {
+        float dt = (agora - ultimoControle) / 1000000.0f;
+        ultimoControle = agora;
 
-    // Aguardando a esfera estar próxima do setpoint
-    if (estado == AGUARDANDO) {
-        if (sensoresValidos && altura >= 1.80f && altura <= 2.20f) {
-            contadorEstavel++;
-        } else {
-            contadorEstavel = 0;
+        int sensor1 = analogRead(SENSOR1_PIN);
+        int sensor2 = analogRead(SENSOR2_PIN);
+
+        float media = (sensor1 + sensor2) / 2.0f;
+        float alturaAtual = calcularAltura(media);
+
+        if (primeiraLeitura) {
+            alturaFiltrada = alturaAtual;
+            alturaAnterior = alturaAtual;
+            primeiraLeitura = false;
         }
 
-        if (contadorEstavel >= 20) {
-            contadorFora = 0;
-            iniciouAtivo = agora;
+        alturaFiltrada += 0.15f * (alturaAtual - alturaFiltrada);
 
-            // Reinicia a estimativa de velocidade
-            alturaAnterior = altura;
-            velocidadeFiltrada = 0.0f;
+        float velocidade = (alturaFiltrada - alturaAnterior) / dt;
 
-            aplicarPWM(PWM_BASE);
-            estado = CONTROLE_PD;
+        velocidadeFiltrada += 0.20f * (velocidade - velocidadeFiltrada);
 
-            Serial.println("\nPD ATIVO: PWM inicial 170");
+        alturaAnterior = alturaFiltrada;
+
+        float erro = ALTURA_REFERENCIA - alturaFiltrada;
+
+        pwmCalculado = PWM_BASE + KP * erro - KD * velocidadeFiltrada;
+
+        pwmCalculado = constrain(pwmCalculado, PWM_MIN, PWM_MAX);
+
+        if (alturaFiltrada >= 3.45f) {
+            pwmCalculado = 0;
         }
-    }
 
-    // Controlador PD
-    else if (estado == CONTROLE_PD) {
-        if (agora - iniciouAtivo >= MAX_ATIVO_MS) {
-            desligar("limite de 5 segundos");
+        if (alturaFiltrada <= 1.10f) {
+            pwmCalculado = PWM_MAX;
         }
-        else if (!sensoresValidos) {
-            desligar("leitura invalida/saturada ou assimetria excessiva");
+
+        analogWrite(ENA, (int)pwmCalculado);
+
+        if (agora - ultimoPrint >= INTERVALO_PRINT) {
+            ultimoPrint = agora;
+
+            Serial.printf(
+                "Altura: %.3f | Ref: %.2f | Erro: %.3f | Vel: %.3f | PWM: %.0f | Base: %.0f | KP: %.2f | KD: %.2f\n",
+                alturaFiltrada,
+                ALTURA_REFERENCIA,
+                erro,
+                velocidadeFiltrada,
+                pwmCalculado,
+                PWM_BASE,
+                KP,
+                KD
+            );
         }
-        else {
-            // Segurança: altura fora da região de controle
-            if (altura < 1.60f || altura > 2.40f) {
-                contadorFora++;
-            } else {
-                contadorFora = 0;
-            }
-
-            if (contadorFora >= 3) {
-                desligar("altura estimada fora da janela");
-            }
-            else {
-                // Derivada da altura usando dt real
-                if (isnan(alturaAnterior)) alturaAnterior = altura;
-
-                float velocidade = (altura - alturaAnterior) / dt;
-                velocidadeFiltrada += ALPHA_VELOCIDADE * (velocidade - velocidadeFiltrada);
-                alturaAnterior = altura;
-
-                // Erro proporcional
-                float erro = SETPOINT_CM - altura;
-
-                // Contribuições P e D
-                float proporcional = KP * erro;
-                float derivativo = -KD * velocidadeFiltrada;
-
-                // Controlador PD
-                float controle = PWM_BASE + proporcional + derivativo;
-
-                int alvo = constrain((int)roundf(controle), PWM_MIN, PWM_MAX);
-
-                // Limita a variação a 1 PWM por ciclo
-                if (alvo > pwmAtual + 1) alvo = pwmAtual + 1;
-                if (alvo < pwmAtual - 1) alvo = pwmAtual - 1;
-
-                aplicarPWM(alvo);
-            }
-        }
-    }
-
-    // Impressão a cada 100 ms
-    if (agora - ultimaImpressao >= 100) {
-        ultimaImpressao = agora;
-
-        const char* nome = estado == CONTROLE_PD ? "PD" :
-                           estado == AGUARDANDO ? "ESPERA" : "OFF";
-
-        float erro = SETPOINT_CM - altura;
-        float proporcional = KP * erro;
-        float derivativo = -KD * velocidadeFiltrada;
-
-        Serial.printf(
-            "%s | S1=%d S2=%d | ADC=%.1f | h=%.3f cm | erro=%+.3f | P=%+.2f | D=%+.2f | vel=%+.3f cm/s | PWM=%d\n",
-            nome, s1, s2, mediaFiltrada, altura, erro,
-            proporcional, derivativo, velocidadeFiltrada, pwmAtual
-        );
     }
 }

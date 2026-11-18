@@ -4,21 +4,19 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# Configurações da comunicação
 PORTA = "COM3"
 BAUDRATE = 115200
 TOTAL_AMOSTRAS = 1500
 TIMEOUT_ENSAIO = 90
 
-# Alturas do CENTRO da esfera em centímetros
 ALTURAS_CM = [
-    0.50, 0.75, 1.00, 1.25,
-    1.50, 1.75, 2.00, 2.25,
-    2.50, 2.75, 3.00, 3.25, 3.50
+    1.00, 1.25, 1.50, 1.75,
+    2.00, 2.25, 2.50, 2.75,
+    3.00, 3.25, 3.50, 3.60
 ]
 
-# Arquivo de saída
 ARQUIVO = Path(__file__).resolve().with_name("dados.txt")
+
 CABECALHO = "data_hora,altura_cm,tipo,tempo_ms,pwm,amostra,sensor1,sensor2,media"
 
 
@@ -133,7 +131,7 @@ def main():
         esp.reset_input_buffer()
 
         print("\n====================================")
-        print("  CALIBRAÇÃO DOS SENSORES HALL")
+        print("     CALIBRAÇÃO DOS SENSORES HALL")
         print("====================================")
         print("PWM: 0")
         print(f"AMOSTRAS POR ALTURA: {TOTAL_AMOSTRAS}")

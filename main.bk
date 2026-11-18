@@ -1,0 +1,219 @@
+
+#include <Arduino.h>
+#include "esp32-hal-cpu.h"
+#include "altura.h"
+#include <math.h>
+#include <stdio.h>
+
+#define SENSOR1_PIN 32
+#define SENSOR2_PIN 33
+
+#define MOTOR_IN1 22
+#define MOTOR_IN2 23
+#define ENA 25
+
+const float ALTURA_REFERENCIA = 2.00f;
+const float PWM_BASE = 180.0f;
+
+float KP = 20.0f;
+float KD = 3.0f;
+
+const float KP_MIN = 0.0f;
+const float KP_MAX = 100.0f;
+const float KD_MIN = 0.0f;
+const float KD_MAX = 20.0f;
+
+const int PWM_MIN = 0;
+const int PWM_MAX = 220;
+
+const unsigned long INTERVALO_CONTROLE = 10000;
+const unsigned long INTERVALO_PRINT = 50000;
+
+float alturaFiltrada = 0.0f;
+float velocidadeFiltrada = 0.0f;
+float alturaAnterior = 0.0f;
+float pwmCalculado = 0.0f;
+
+bool controleAtivo = false;
+bool primeiraLeitura = true;
+bool aguardandoGanhos = false;
+
+unsigned long ultimoControle = 0;
+unsigned long ultimoPrint = 0;
+
+void desligarMotor() {
+    analogWrite(ENA, 0);
+    pwmCalculado = 0;
+}
+
+void iniciarControle() {
+    int sensor1 = analogRead(SENSOR1_PIN);
+    int sensor2 = analogRead(SENSOR2_PIN);
+
+    float media = (sensor1 + sensor2) / 2.0f;
+    alturaFiltrada = calcularAltura(media);
+    alturaAnterior = alturaFiltrada;
+    velocidadeFiltrada = 0.0f;
+
+    primeiraLeitura = false;
+    ultimoControle = micros();
+    ultimoPrint = millis() * 1000UL;
+
+    controleAtivo = true;
+
+    Serial.println("Controle iniciado");
+}
+
+void processarComando(String comando) {
+    comando.trim();
+    
+    if (comando.length() == 0) {
+        return;
+    }
+
+    if (aguardandoGanhos) {
+        float kpNovo;
+        float kdNovo;
+
+        if (sscanf(comando.c_str(), "%f,%f", &kpNovo, &kdNovo) == 2 &&
+            isfinite(kpNovo) && isfinite(kdNovo)) {
+
+            if (kpNovo >= KP_MIN && kpNovo <= KP_MAX &&
+                kdNovo >= KD_MIN && kdNovo <= KD_MAX) {
+
+                KP = kpNovo;
+                KD = kdNovo;
+
+                Serial.printf("Novos ganhos: KP = %.2f | KD = %.2f\n", KP, KD);
+            } else {
+                Serial.println("Valores fora dos limites permitidos");
+            }
+        } else {
+            Serial.println("Formato invalido. Utilize: KP,KD");
+        }
+
+        aguardandoGanhos = false;
+        return;
+    }
+
+    comando.toLowerCase();
+
+    if (comando == "s") {
+        if (!controleAtivo) {
+            iniciarControle();
+        } else {
+            Serial.println("Controle ja esta ativo");
+        }
+    } 
+    else if (comando == "p") {
+        controleAtivo = false;
+        desligarMotor();
+        Serial.println("Controle pausado. PWM desligado");
+    } 
+    else if (comando == "c") {
+        aguardandoGanhos = true;
+        Serial.println("Digite KP,KD. Exemplo: 30,5");
+    } 
+    else {
+        Serial.println("Comando desconhecido");
+        Serial.println("Comandos: s, p, c");
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    Serial.setTimeout(50);
+
+    setCpuFrequencyMhz(240);
+
+    analogReadResolution(12);
+
+    analogSetPinAttenuation(SENSOR1_PIN, ADC_11db);
+    analogSetPinAttenuation(SENSOR2_PIN, ADC_11db);
+
+    pinMode(SENSOR1_PIN, INPUT);
+    pinMode(SENSOR2_PIN, INPUT);
+
+    pinMode(MOTOR_IN1, OUTPUT);
+    pinMode(MOTOR_IN2, OUTPUT);
+    pinMode(ENA, OUTPUT);
+
+    digitalWrite(MOTOR_IN1, HIGH);
+    digitalWrite(MOTOR_IN2, LOW);
+
+    desligarMotor();
+
+    Serial.println("Levitador magnetico pronto");
+    Serial.println("Envie s para iniciar");
+    Serial.println("Envie p para pausar");
+    Serial.println("Envie c para configurar KP e KD");
+    Serial.printf("KP: %.2f | KD: %.2f\n", KP, KD);
+}
+
+void loop() {
+    if (Serial.available()) {
+        String comando = Serial.readStringUntil('\n');
+        processarComando(comando);
+    }
+
+    if (!controleAtivo) {
+        return;
+    }
+
+    unsigned long agora = micros();
+
+    if (agora - ultimoControle >= INTERVALO_CONTROLE) {
+        float dt = (agora - ultimoControle) / 1000000.0f;
+        ultimoControle = agora;
+
+        int sensor1 = analogRead(SENSOR1_PIN);
+        int sensor2 = analogRead(SENSOR2_PIN);
+
+        float media = (sensor1 + sensor2) / 2.0f;
+        float alturaAtual = calcularAltura(media);
+
+        if (primeiraLeitura) {
+            alturaFiltrada = alturaAtual;
+            alturaAnterior = alturaAtual;
+            primeiraLeitura = false;
+        }
+
+        alturaFiltrada += 0.15f * (alturaAtual - alturaFiltrada);
+
+        float velocidade = (alturaFiltrada - alturaAnterior) / dt;
+
+        velocidadeFiltrada += 0.20f * (velocidade - velocidadeFiltrada);
+
+        alturaAnterior = alturaFiltrada;
+
+        float erro = ALTURA_REFERENCIA - alturaFiltrada;
+
+        pwmCalculado = PWM_BASE + KP * erro - KD * velocidadeFiltrada;
+
+        pwmCalculado = constrain(pwmCalculado, PWM_MIN, PWM_MAX);
+
+        if (alturaFiltrada >= 3.45f) {
+            pwmCalculado = 0;
+        }
+
+        if (alturaFiltrada <= 1.10f) {
+            pwmCalculado = PWM_MAX;
+        }
+
+        analogWrite(ENA, (int)pwmCalculado);
+
+        if (agora - ultimoPrint >= INTERVALO_PRINT) {
+            ultimoPrint = agora;
+
+            Serial.printf(
+                "Altura: %.3f | Erro: %.3f | Vel: %.3f | PWM: %.0f | KP: %.2f | KD: %.2f\n",
+                alturaFiltrada,
+                erro,
+                velocidadeFiltrada,
+                pwmCalculado,
+                KP,
+                KD
+            );
+        }
+    }
+}

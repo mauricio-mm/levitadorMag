@@ -14,9 +14,9 @@
 
 float ALTURA_REFERENCIA = 2.0f;
 float PWM_BASE = 190.0f;
-
-float KP = 30.0f;
-float KD = 1.0f;
+float KP = 50.0f;
+float KD = 4.5f;
+float polo = 0.8;
 
 const float KP_MIN = 0.0f;
 const float KP_MAX = 100.0f;
@@ -30,14 +30,20 @@ const float PWM_BASE_MIN = 0.0f;
 const float PWM_BASE_MAX = 230.0f;
 
 const int PWM_MIN = 0;
-const int PWM_MAX = 230;
+const int PWM_MAX = 245;
 
 const unsigned long INTERVALO_CONTROLE = 1000;
-const unsigned long INTERVALO_PRINT = 50000;
+const unsigned long INTERVALO_PRINT = 25000;
 
+float velocidade = 0.0f;
+float alturaAnteriorVelocidade = 0.0f;
+
+unsigned long ultimoCalculoVelocidade = 0;
+const unsigned long INTERVALO_VELOCIDADE = 10000;
+
+float alturaAtual = 0;
 float alturaFiltrada = 0.0f;
-float velocidadeFiltrada = 0.0f;
-float alturaAnterior = 0.0f;
+float alturaFiltradaAnterior = 0.0f;
 float pwmCalculado = 0.0f;
 
 bool controleAtivo = false;
@@ -59,13 +65,18 @@ void iniciarControle() {
     int sensor2 = analogRead(SENSOR2_PIN);
 
     float media = (sensor1 + sensor2) / 2.0f;
-    alturaFiltrada = calcularAltura(media);
-    alturaAnterior = alturaFiltrada;
-    velocidadeFiltrada = 0.0f;
+    alturaAtual = calcularAltura(media);
 
     primeiraLeitura = false;
     ultimoControle = micros();
     ultimoPrint = millis() * 1000UL;
+
+    alturaFiltrada = alturaAtual;
+    alturaFiltradaAnterior = alturaAtual;
+    alturaAnteriorVelocidade = alturaAtual;
+
+    velocidade = 0.0f;
+    ultimoCalculoVelocidade = micros();
 
     controleAtivo = true;
 
@@ -82,18 +93,21 @@ void processarComando(String comando) {
     if (aguardandoGanhos || aguardandoAltura || aguardandoPWM) {
         float valor1;
         float valor2;
+        float valor3;
 
         if (aguardandoGanhos) {
-            if (sscanf(comando.c_str(), "%f,%f", &valor1, &valor2) == 2 &&
-                isfinite(valor1) && isfinite(valor2)) {
+            if (sscanf(comando.c_str(), "%f,%f,%f", &valor1, &valor2, &valor3) == 3 &&
+                isfinite(valor1) && isfinite(valor2) && isfinite(valor3)) {
 
                 if (valor1 >= KP_MIN && valor1 <= KP_MAX &&
-                    valor2 >= KD_MIN && valor2 <= KD_MAX) {
+                    valor2 >= KD_MIN && valor2 <= KD_MAX &&
+                    valor3 >= 0 && valor3 <= 100) {
 
                     KP = valor1;
                     KD = valor2;
+                    polo = valor3;
 
-                    Serial.printf("Novos ganhos: KP = %.2f | KD = %.2f\n", KP, KD);
+                    Serial.printf("Novos ganhos: KP = %.2f | KD = %.2f\n  | polo = %.2f\n", KP, KD, polo);
                 } else {
                     Serial.println("Valores fora dos limites permitidos");
                 }
@@ -223,7 +237,7 @@ void loop() {
 
     if (agora - ultimoControle >= INTERVALO_CONTROLE) {
         float dt = (agora - ultimoControle) / 1000000.0f;
-        ultimoControle = agora;
+        ultimoControle = agora;                 
 
         int sensor1 = analogRead(SENSOR1_PIN);
         int sensor2 = analogRead(SENSOR2_PIN);
@@ -231,23 +245,37 @@ void loop() {
         float media = (sensor1 + sensor2) / 2.0f;
         float alturaAtual = calcularAltura(media);
 
+        // if (alturaAtual > ALTURA_REFERENCIA) {
+        //     alturaAtual = ALTURA_REFERENCIA + (alturaAtual - ALTURA_REFERENCIA)/2;
+        // }
+
         if (primeiraLeitura) {
             alturaFiltrada = alturaAtual;
-            alturaAnterior = alturaAtual;
+            alturaFiltradaAnterior = alturaAtual;
             primeiraLeitura = false;
         }
 
-        alturaFiltrada += 0.15f * (alturaAtual - alturaFiltrada);
+        alturaFiltrada = (polo*alturaFiltradaAnterior) + (( 1 - polo) * alturaAtual);
 
-        float velocidade = (alturaFiltrada - alturaAnterior) / dt;
+        if (agora - ultimoCalculoVelocidade >= INTERVALO_VELOCIDADE) {
+            float dtVelocidade = (agora - ultimoCalculoVelocidade) / 1000000.0f;
 
-        velocidadeFiltrada += 0.20f * (velocidade - velocidadeFiltrada);
+            velocidade = (alturaFiltrada - alturaAnteriorVelocidade) / dtVelocidade;
 
-        alturaAnterior = alturaFiltrada;
+            alturaAnteriorVelocidade = alturaFiltrada;
+            ultimoCalculoVelocidade = agora;
+        }        
+
+        alturaFiltradaAnterior = alturaFiltrada;
 
         float erro = ALTURA_REFERENCIA - alturaFiltrada;
+        
+        // if (erro < 0)
+        // {
+        //     erro = erro/2;
+        // }
 
-        pwmCalculado = PWM_BASE + KP * erro - KD * velocidadeFiltrada;
+        pwmCalculado = PWM_BASE + KP * erro - KD * velocidade;
 
         pwmCalculado = constrain(pwmCalculado, PWM_MIN, PWM_MAX);
 
@@ -255,7 +283,7 @@ void loop() {
             pwmCalculado = 0;
         }
 
-        if (alturaFiltrada <= 1.10f) {
+        if (alturaFiltrada <= 1.40f) {
             pwmCalculado = PWM_MAX;
         }
 
@@ -265,11 +293,12 @@ void loop() {
             ultimoPrint = agora;
 
             Serial.printf(
-                "Altura: %.3f | Ref: %.2f | Erro: %.3f | Vel: %.3f | PWM: %.0f | Base: %.0f | KP: %.2f | KD: %.2f\n",
+                "Tempo: %0.3f | Altura Filtrada: %.3f | Ref: %.2f | Erro: %.3f | Vel: %.3f | PWM: %.0f | Base: %.0f | KP: %.2f | KD: %.2f\n",
+                agora / 1000000.0,                
                 alturaFiltrada,
                 ALTURA_REFERENCIA,
                 erro,
-                velocidadeFiltrada,
+                velocidade,
                 pwmCalculado,
                 PWM_BASE,
                 KP,
